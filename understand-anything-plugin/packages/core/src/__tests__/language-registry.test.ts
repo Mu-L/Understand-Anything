@@ -74,6 +74,14 @@ describe("LanguageRegistry", () => {
       expect(registry.getByExtension(".js")?.id).toBe("javascript");
     });
 
+    it("registers Swift with tree-sitter grammar metadata", () => {
+      const registry = LanguageRegistry.createDefault();
+      expect(registry.getById("swift")?.treeSitter).toEqual({
+        wasmPackage: "@understand-anything/tree-sitter-swift-wasm",
+        wasmFile: "tree-sitter-swift.wasm",
+      });
+    });
+
     it("has no duplicate extension mappings across configs", () => {
       const registry = LanguageRegistry.createDefault();
       const all = registry.getAllLanguages();

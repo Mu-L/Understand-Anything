@@ -63,6 +63,9 @@ importers:
       '@understand-anything/tree-sitter-dart-wasm':
         specifier: workspace:*
         version: link:../tree-sitter-dart-wasm
+      '@understand-anything/tree-sitter-swift-wasm':
+        specifier: workspace:*
+        version: link:../tree-sitter-swift-wasm
       fuse.js:
         specifier: ^7.1.0
         version: 7.1.0
@@ -202,6 +205,8 @@ importers:
         version: 3.2.4(@types/debug@4.1.12)(@types/node@25.5.0)(jiti@2.6.1)(lightningcss@1.32.0)(yaml@2.8.3)
 
   understand-anything-plugin/packages/tree-sitter-dart-wasm: {}
+
+  understand-anything-plugin/packages/tree-sitter-swift-wasm: {}
 
 packages:
 
