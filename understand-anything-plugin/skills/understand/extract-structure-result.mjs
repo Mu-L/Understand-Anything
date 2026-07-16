@@ -1,5 +1,63 @@
 // Pure result mapping for extract-structure.mjs.
 // Kept separate from the CLI entrypoint so unit tests do not import a shebang script.
+function mapCallGraph(callGraph) {
+  return callGraph && callGraph.length > 0
+    ? callGraph.map(entry => ({
+        caller: entry.caller,
+        callee: entry.callee,
+        lineNumber: entry.lineNumber,
+      }))
+    : null;
+}
+
+export function analyzeFileWithOutcomes(registry, file, content) {
+  const wantsCallGraph =
+    file.fileCategory === 'code' || file.fileCategory === 'script';
+  let analysis = null;
+  let callGraph = null;
+  let structureOutcome = 'failed';
+  let callGraphOutcome = wantsCallGraph ? 'failed' : 'skipped';
+
+  let full = null;
+  if (wantsCallGraph && typeof registry.analyzeFileFull === 'function') {
+    try {
+      full = registry.analyzeFileFull(file.path, content);
+    } catch {
+      full = null;
+    }
+  }
+
+  if (full) {
+    analysis = full.structure ?? null;
+    callGraph = mapCallGraph(full.callGraph);
+    structureOutcome = analysis === null ? 'failed' : 'succeeded';
+    callGraphOutcome = Array.isArray(full.callGraph) ? 'succeeded' : 'failed';
+  } else {
+    try {
+      analysis = registry.analyzeFile(file.path, content) ?? null;
+      structureOutcome = analysis === null ? 'failed' : 'succeeded';
+    } catch {
+      analysis = null;
+      structureOutcome = 'failed';
+    }
+
+    if (wantsCallGraph) {
+      try {
+        const extractedCallGraph = registry.extractCallGraph(file.path, content);
+        callGraph = mapCallGraph(extractedCallGraph);
+        callGraphOutcome = Array.isArray(extractedCallGraph)
+          ? 'succeeded'
+          : 'failed';
+      } catch {
+        callGraph = null;
+        callGraphOutcome = 'failed';
+      }
+    }
+  }
+
+  return { analysis, callGraph, structureOutcome, callGraphOutcome };
+}
+
 export function buildResult(file, totalLines, nonEmptyLines, analysis, callGraph, batchImportData) {
   const base = {
     path: file.path,

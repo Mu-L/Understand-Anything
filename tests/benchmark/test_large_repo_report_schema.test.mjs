@@ -47,6 +47,7 @@ function validReport() {
   return {
     schemaUrl: schema.$id,
     schemaVersion: '1.0.0',
+    pairId: '11111111-1111-4111-8111-111111111111',
     status: 'ok',
     mode: 'deterministic',
     run: {
@@ -113,11 +114,18 @@ function validReport() {
         warningCount: 0,
         warningMessages: [],
         warningMessagesTruncated: false,
+        failureSamples: [],
+        failureSamplesTruncated: false,
         outputBytes: 128,
         batchesSucceeded: 1,
         batchesFailed: 0,
         filesAnalyzed: 1,
         filesSkipped: 0,
+        structureSucceeded: 1,
+        structureFailed: 0,
+        callGraphSucceeded: 1,
+        callGraphFailed: 0,
+        callGraphSkipped: 0,
         entities: {
           functions: 0,
           classes: 0,
@@ -139,6 +147,8 @@ function validReport() {
       unexpectedBatchFiles: 0,
       missingImportTargets: 0,
       structureCoverage: 1,
+      structureFailures: 0,
+      callGraphFailures: 0,
       filesSkipped: 0,
       failedBatches: 0,
       missingStructurePaths: 0,
@@ -158,6 +168,7 @@ function validReport() {
       costUsd: null,
     },
     warnings: [],
+    secondaryErrors: [],
     error: null,
   };
 }
@@ -169,6 +180,8 @@ describe('large repository report schema 1.0.0', () => {
     degraded.status = 'degraded';
     degraded.stages.structure.filesAnalyzed = 0;
     degraded.stages.structure.filesSkipped = 1;
+    degraded.stages.structure.structureSucceeded = 0;
+    degraded.stages.structure.callGraphSucceeded = 0;
     degraded.integrity.filesSkipped = 1;
 
     expectValid(ok);
@@ -258,6 +271,23 @@ describe('large repository report schema 1.0.0', () => {
   ])('rejects successful status with failing integrity %s', (field, value) => {
     const report = validReport();
     report.integrity[field] = value;
+    expectInvalid(report);
+  });
+
+  it('rejects degraded status without a warning or skipped-file reason', () => {
+    const report = validReport();
+    report.status = 'degraded';
+
+    expectInvalid(report);
+  });
+
+  it('rejects warning summaries whose count is zero', () => {
+    const report = validReport();
+    report.status = 'degraded';
+    report.warnings = [
+      { stage: 'scan', count: 0, messages: [], truncated: false },
+    ];
+
     expectInvalid(report);
   });
 });

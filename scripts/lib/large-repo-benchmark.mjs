@@ -65,6 +65,7 @@ export const GIT_METADATA_MAX_BUFFER = 64 * 1024;
 // from each stream while continuing to drain and inspect all child output.
 export const STAGE_OUTPUT_MAX_BYTES = 128 * 1024;
 export const WARNING_SAMPLE_LIMIT = 5;
+export const STRUCTURE_DIAGNOSTIC_SAMPLE_MAX_BYTES = 4 * 1024;
 const ENTITY_FIELDS = [
   'functions',
   'classes',
@@ -93,10 +94,18 @@ export class BenchmarkStageError extends Error {
 }
 
 export class BenchmarkReportWriteError extends Error {
-  constructor(artifactRoot = null) {
+  constructor(artifactRoot = null, recovery = {}) {
     super('Unable to write benchmark report files');
     this.name = 'BenchmarkReportWriteError';
     this.artifactRoot = artifactRoot;
+    this.recovery = {
+      lockAcquisitionFailed: recovery.lockAcquisitionFailed ?? false,
+      rollbackRemoveFailures: recovery.rollbackRemoveFailures ?? 0,
+      restoreFailures: recovery.restoreFailures ?? 0,
+      tempCleanupFailures: recovery.tempCleanupFailures ?? 0,
+      backupCleanupFailures: recovery.backupCleanupFailures ?? 0,
+      lockReleaseFailures: recovery.lockReleaseFailures ?? 0,
+    };
   }
 }
 
@@ -236,6 +245,9 @@ export function parseArgs(argv, cwd = process.cwd()) {
 
   if (help) return { help: true };
   if (!repoValue) throw new CliUsageError('A repository path is required');
+  if (outputValue === null || outputValue.trim() === '') {
+    throw new CliUsageError('--output is required and must be non-empty');
+  }
   if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 32) {
     throw new CliUsageError('--concurrency must be an integer between 1 and 32');
   }
@@ -248,10 +260,7 @@ export function parseArgs(argv, cwd = process.cwd()) {
     throw new CliUsageError(`Repository path is not a directory: ${repoValue}`);
   }
 
-  const outputPath = resolve(
-    cwd,
-    outputValue ?? join('benchmark-results', 'large-repo-report.json'),
-  );
+  const outputPath = resolve(cwd, outputValue);
   const markdownPath = resolve(
     cwd,
     outputPath.toLowerCase().endsWith('.json')
@@ -278,11 +287,11 @@ export function parseArgs(argv, cwd = process.cwd()) {
 
 export function helpText() {
   return `Usage:
-  node scripts/benchmark-large-repo.mjs <repo-path> [options]
-  node scripts/benchmark-large-repo.mjs --repo <repo-path> [options]
+  node scripts/benchmark-large-repo.mjs <repo-path> --output <path> [options]
+  node scripts/benchmark-large-repo.mjs --repo <repo-path> --output <path> [options]
 
 Options:
-  -o, --output <path>       JSON report path
+  -o, --output <path>       JSON report path (required)
       --label <name>        Public label for the subject repository
       --concurrency <1-32>  Structural extraction workers (default: 5)
       --keep-artifacts      Preserve temporary deterministic outputs
@@ -397,7 +406,13 @@ function addRootAliases(aliases, root, replacement) {
 
 function hasPathBoundary(text, index) {
   if (index >= text.length) return true;
-  return text[index] === '/' || text[index] === '\\';
+  return (
+    text[index] === '/' ||
+    text[index] === '\\' ||
+    text[index] === '\n' ||
+    text[index] === '\r' ||
+    text[index] === '\t'
+  );
 }
 
 function replacePathAlias(text, alias, replacement, caseInsensitive) {
@@ -675,6 +690,99 @@ function readJson(path) {
   return JSON.parse(readFileSync(path, 'utf-8'));
 }
 
+function isRecord(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isNonNegativeInteger(value) {
+  return Number.isInteger(value) && value >= 0;
+}
+
+function isStringCountMap(value) {
+  return (
+    isRecord(value) && Object.values(value).every(isNonNegativeInteger)
+  );
+}
+
+function validateScanArtifact(scan) {
+  if (
+    !isRecord(scan) ||
+    scan.scriptCompleted !== true ||
+    !Array.isArray(scan.files) ||
+    !isNonNegativeInteger(scan.totalFiles) ||
+    scan.totalFiles !== scan.files.length ||
+    !isNonNegativeInteger(scan.filteredByIgnore) ||
+    !isRecord(scan.stats) ||
+    !isNonNegativeInteger(scan.stats.filesScanned) ||
+    scan.stats.filesScanned !== scan.totalFiles ||
+    !isStringCountMap(scan.stats.byCategory) ||
+    !isStringCountMap(scan.stats.byLanguage) ||
+    typeof scan.contentDigest !== 'string' ||
+    !/^[a-f0-9]{64}$/.test(scan.contentDigest) ||
+    scan.files.some(
+      (file) =>
+        !isRecord(file) ||
+        typeof file.path !== 'string' ||
+        file.path.length === 0 ||
+        !isNonNegativeInteger(file.sizeLines),
+    )
+  ) {
+    throw new Error('Scan artifact does not match the required shape');
+  }
+}
+
+function validateImportArtifact(imports) {
+  if (
+    !isRecord(imports) ||
+    imports.scriptCompleted !== true ||
+    !isRecord(imports.importMap) ||
+    !isRecord(imports.stats) ||
+    !isNonNegativeInteger(imports.stats.filesScanned) ||
+    !isNonNegativeInteger(imports.stats.filesWithImports) ||
+    !isNonNegativeInteger(imports.stats.totalEdges) ||
+    Object.values(imports.importMap).some(
+      (targets) =>
+        !Array.isArray(targets) ||
+        targets.some((target) => typeof target !== 'string'),
+    )
+  ) {
+    throw new Error('Import artifact does not match the required shape');
+  }
+}
+
+function validateBatchArtifact(batches) {
+  if (
+    !isRecord(batches) ||
+    batches.schemaVersion !== 1 ||
+    typeof batches.algorithm !== 'string' ||
+    batches.algorithm.length === 0 ||
+    !Array.isArray(batches.batches) ||
+    !isNonNegativeInteger(batches.totalBatches) ||
+    batches.totalBatches !== batches.batches.length ||
+    batches.batches.some(
+      (batch) =>
+        !isRecord(batch) ||
+        !isNonNegativeInteger(batch.batchIndex) ||
+        !Array.isArray(batch.files) ||
+        !isRecord(batch.batchImportData) ||
+        !isRecord(batch.neighborMap),
+    )
+  ) {
+    throw new Error('Batch artifact does not match the required shape');
+  }
+}
+
+function markArtifactFailure(stage, stageName, error, redactionRoots) {
+  const rawMessage = error instanceof Error ? error.message : String(error);
+  const safeMessage = sanitizeBounded(
+    `${stageName} stage produced an invalid artifact: ${rawMessage}`,
+    redactionRoots,
+  );
+  stage.status = 'failed';
+  stage.stderr = safeMessage.text;
+  stage.stderrTruncated ||= safeMessage.truncated;
+}
+
 function fileSizeOrZero(path) {
   try {
     return statSync(path).size;
@@ -696,25 +804,56 @@ function preflightReportTargets(paths, fileSystem) {
   }
 }
 
-function bestEffortRemove(path, fileSystem) {
+function tryRemove(path, fileSystem) {
   try {
     fileSystem.rmSync(path, { force: true });
+    return true;
   } catch {
-    // Transaction cleanup must never mask the primary delivery failure.
+    return false;
   }
 }
 
-function rollbackReportEntry(entry, fileSystem) {
+function rollbackReportEntry(entry, fileSystem, recovery) {
   if (entry.backupMoved) {
-    bestEffortRemove(entry.targetPath, fileSystem);
+    if (!tryRemove(entry.targetPath, fileSystem)) {
+      recovery.rollbackRemoveFailures += 1;
+    }
     try {
       fileSystem.renameSync(entry.backupPath, entry.targetPath);
     } catch {
-      // Leave an unrestored backup in place rather than delete original data.
+      recovery.restoreFailures += 1;
     }
   } else if (!entry.hadOriginal && entry.installAttempted) {
-    bestEffortRemove(entry.targetPath, fileSystem);
+    if (!tryRemove(entry.targetPath, fileSystem)) {
+      recovery.rollbackRemoveFailures += 1;
+    }
   }
+}
+
+export function reportPairLockPath(outputPath, markdownPath) {
+  const outputDirectory = canonicalizePhysicalPath(dirname(outputPath));
+  const markdownDirectory = canonicalizePhysicalPath(dirname(markdownPath));
+  const normalizePairPath = (pathValue) =>
+    process.platform === 'win32' ? pathValue.toLowerCase() : pathValue;
+  if (
+    normalizePairPath(outputDirectory) !==
+    normalizePairPath(markdownDirectory)
+  ) {
+    throw new Error('Benchmark report files must share a directory');
+  }
+  const normalizedOutputPath = normalizePairPath(
+    canonicalizePhysicalPath(outputPath),
+  );
+  const normalizedMarkdownPath = normalizePairPath(
+    canonicalizePhysicalPath(markdownPath),
+  );
+  const pairKey = createHash('sha256')
+    .update(normalizedOutputPath)
+    .update('\0')
+    .update(normalizedMarkdownPath)
+    .digest('hex')
+    .slice(0, 24);
+  return join(resolve(dirname(outputPath)), `.ua-report-pair-${pairKey}.lock`);
 }
 
 function stageReportEntry(entry, fileSystem) {
@@ -752,6 +891,17 @@ export function deliverBenchmarkReports(reportFiles, operations = {}) {
     writeFileSync: operations.writeFileSync ?? writeFileSync,
   };
   const transactionId = randomUUID();
+  const recovery = {
+    lockAcquisitionFailed: false,
+    rollbackRemoveFailures: 0,
+    restoreFailures: 0,
+    tempCleanupFailures: 0,
+    backupCleanupFailures: 0,
+    lockReleaseFailures: 0,
+  };
+  let deliveryFailed = false;
+  let lockOwned = false;
+  let lockPath = null;
   const entries = [
     [reportFiles.outputPath, reportFiles.jsonContents],
     [reportFiles.markdownPath, reportFiles.markdownContents],
@@ -775,6 +925,19 @@ export function deliverBenchmarkReports(reportFiles, operations = {}) {
   try {
     for (const entry of entries) {
       fileSystem.mkdirSync(dirname(entry.targetPath), { recursive: true });
+    }
+    lockPath = reportPairLockPath(
+      reportFiles.outputPath,
+      reportFiles.markdownPath,
+    );
+    let lockDescriptor;
+    try {
+      lockDescriptor = fileSystem.openSync(lockPath, 'wx');
+      lockOwned = true;
+      fileSystem.closeSync(lockDescriptor);
+    } catch (error) {
+      if (!lockOwned) recovery.lockAcquisitionFailed = true;
+      throw error;
     }
     preflightReportTargets(
       entries.map((entry) => entry.targetPath),
@@ -802,20 +965,36 @@ export function deliverBenchmarkReports(reportFiles, operations = {}) {
     }
     for (const entry of entries) {
       if (entry.backupMoved) {
-        bestEffortRemove(entry.backupPath, fileSystem);
+        if (!tryRemove(entry.backupPath, fileSystem)) {
+          recovery.backupCleanupFailures += 1;
+        }
       }
     }
   } catch {
+    deliveryFailed = true;
     for (const entry of [...entries].reverse()) {
-      rollbackReportEntry(entry, fileSystem);
+      rollbackReportEntry(entry, fileSystem, recovery);
     }
-    throw new BenchmarkReportWriteError();
   } finally {
     for (const entry of entries) {
       if (entry.tempCreated) {
-        bestEffortRemove(entry.tempPath, fileSystem);
+        if (!tryRemove(entry.tempPath, fileSystem)) {
+          recovery.tempCleanupFailures += 1;
+        }
       }
     }
+    if (lockOwned && !tryRemove(lockPath, fileSystem)) {
+      recovery.lockReleaseFailures += 1;
+    }
+  }
+
+  if (
+    deliveryFailed ||
+    recovery.tempCleanupFailures > 0 ||
+    recovery.backupCleanupFailures > 0 ||
+    recovery.lockReleaseFailures > 0
+  ) {
+    throw new BenchmarkReportWriteError(null, recovery);
   }
 }
 
@@ -863,9 +1042,12 @@ export function renderMarkdownReport(report) {
     '| Metric | Value |',
     '| --- | --- |',
     metricRow('Status', report.status),
+    metricRow('Pair ID', report.pairId),
     metricRow('Subject', report.subject.label),
     metricRow('Subject commit', report.subject.commit),
+    metricRow('Subject dirty', report.subject.dirty),
     metricRow('Tool commit', report.tool.commit),
+    metricRow('Tool dirty', report.tool.dirty),
     metricRow('Tool version', report.tool.packageVersion),
     metricRow('Started (UTC)', report.run.startedAt),
     metricRow('Total duration', duration(report.run.durationMs)),
@@ -917,10 +1099,27 @@ export function renderMarkdownReport(report) {
     metricRow('Memory (bytes)', report.environment.totalMemoryBytes),
   ];
 
+  if (report.subject.dirty === true || report.tool.dirty === true) {
+    lines.push(
+      '',
+      '> **Warning:** The subject or tool worktree was dirty; commit hashes alone do not reproduce this run.',
+    );
+  }
+
   if (report.warnings.length > 0) {
     lines.push('', '## Warnings', '');
     for (const warning of report.warnings) {
       lines.push(`- ${markdownValue(warning.stage)}: ${warning.count}`);
+    }
+  }
+  if ((report.secondaryErrors?.length ?? 0) > 0) {
+    lines.push('', '## Secondary errors', '');
+    for (const secondaryError of report.secondaryErrors) {
+      lines.push(
+        `- ${markdownValue(secondaryError.stage)}: ${markdownValue(
+          secondaryError.message,
+        )}`,
+      );
     }
   }
   if (report.error) {
@@ -1033,11 +1232,21 @@ export function aggregateStructureSummaries(structureSummaries) {
   const aggregate = {
     filesAnalyzed: 0,
     filesSkipped: 0,
+    structureSucceeded: 0,
+    structureFailed: 0,
+    callGraphSucceeded: 0,
+    callGraphFailed: 0,
+    callGraphSkipped: 0,
     entities: emptyEntityCounts(),
   };
   for (const summary of structureSummaries) {
     aggregate.filesAnalyzed += summary.filesAnalyzed;
     aggregate.filesSkipped += summary.filesSkipped;
+    aggregate.structureSucceeded += summary.structureSucceeded;
+    aggregate.structureFailed += summary.structureFailed;
+    aggregate.callGraphSucceeded += summary.callGraphSucceeded;
+    aggregate.callGraphFailed += summary.callGraphFailed;
+    aggregate.callGraphSkipped += summary.callGraphSkipped;
     for (const field of ENTITY_FIELDS) {
       aggregate.entities[field] += summary.entities[field];
     }
@@ -1051,6 +1260,24 @@ export function summarizeStructureOutput(batch, output) {
   const skippedPaths = Array.isArray(output?.filesSkipped)
     ? output.filesSkipped
     : [];
+  const outcomeCounts = output?.analysisOutcomes;
+  const hasOutcomeCounts = outcomeCounts !== undefined;
+  const isCount = (value) => Number.isInteger(value) && value >= 0;
+  const structureSucceeded = hasOutcomeCounts
+    ? outcomeCounts?.structure?.succeeded
+    : results.length;
+  const structureFailed = hasOutcomeCounts
+    ? outcomeCounts?.structure?.failed
+    : 0;
+  const callGraphSucceeded = hasOutcomeCounts
+    ? outcomeCounts?.callGraph?.succeeded
+    : 0;
+  const callGraphFailed = hasOutcomeCounts
+    ? outcomeCounts?.callGraph?.failed
+    : 0;
+  const callGraphSkipped = hasOutcomeCounts
+    ? outcomeCounts?.callGraph?.skipped
+    : results.length;
   let malformed =
     !output ||
     typeof output !== 'object' ||
@@ -1059,7 +1286,14 @@ export function summarizeStructureOutput(batch, output) {
     !Array.isArray(output.results) ||
     !Array.isArray(output.filesSkipped) ||
     !Number.isInteger(output.filesAnalyzed) ||
-    output.filesAnalyzed !== results.length;
+    output.filesAnalyzed !== results.length ||
+    !isCount(structureSucceeded) ||
+    !isCount(structureFailed) ||
+    !isCount(callGraphSucceeded) ||
+    !isCount(callGraphFailed) ||
+    !isCount(callGraphSkipped) ||
+    structureSucceeded + structureFailed !== results.length ||
+    callGraphSucceeded + callGraphFailed + callGraphSkipped !== results.length;
 
   const pathCounts = new Map();
   const entities = emptyEntityCounts();
@@ -1101,6 +1335,8 @@ export function summarizeStructureOutput(batch, output) {
     digest: canonicalSha256(output),
     complete:
       !malformed &&
+      structureFailed === 0 &&
+      callGraphFailed === 0 &&
       missingStructurePaths === 0 &&
       duplicateStructurePaths === 0 &&
       unexpectedStructurePaths === 0,
@@ -1109,6 +1345,11 @@ export function summarizeStructureOutput(batch, output) {
     accountedExpectedPaths,
     filesAnalyzed: results.length,
     filesSkipped: skippedPaths.length,
+    structureSucceeded: isCount(structureSucceeded) ? structureSucceeded : 0,
+    structureFailed: isCount(structureFailed) ? structureFailed : 0,
+    callGraphSucceeded: isCount(callGraphSucceeded) ? callGraphSucceeded : 0,
+    callGraphFailed: isCount(callGraphFailed) ? callGraphFailed : 0,
+    callGraphSkipped: isCount(callGraphSkipped) ? callGraphSkipped : 0,
     missingStructurePaths,
     duplicateStructurePaths,
     unexpectedStructurePaths,
@@ -1203,8 +1444,16 @@ export function buildBenchmarkIntegrity(
     }
   }
 
-  const accountedExpectedPaths = structureSummaries.reduce(
-    (sum, summary) => sum + summary.accountedExpectedPaths,
+  const structureSucceeded = structureSummaries.reduce(
+    (sum, summary) => sum + summary.structureSucceeded,
+    0,
+  );
+  const structureFailures = structureSummaries.reduce(
+    (sum, summary) => sum + summary.structureFailed,
+    0,
+  );
+  const callGraphFailures = structureSummaries.reduce(
+    (sum, summary) => sum + summary.callGraphFailed,
     0,
   );
   const filesSkipped = structureSummaries.reduce(
@@ -1236,9 +1485,14 @@ export function buildBenchmarkIntegrity(
     unexpectedBatchFiles: unexpectedBatchFiles.length,
     missingImportTargets,
     structureCoverage:
-      scan.totalFiles === 0
+      structureSucceeded + structureFailures === 0
         ? 1
-        : Math.round((accountedExpectedPaths / scan.totalFiles) * 10000) / 10000,
+        : Math.round(
+            (structureSucceeded / (structureSucceeded + structureFailures)) *
+              10000,
+          ) / 10000,
+    structureFailures,
+    callGraphFailures,
     filesSkipped,
     failedBatches,
     missingStructurePaths,
@@ -1253,6 +1507,8 @@ export function hasFailedIntegrity(integrity) {
     !integrity.allScannedFilesBatched ||
     integrity.missingImportTargets > 0 ||
     integrity.structureCoverage !== 1 ||
+    integrity.structureFailures > 0 ||
+    integrity.callGraphFailures > 0 ||
     integrity.failedBatches > 0 ||
     integrity.missingStructurePaths > 0 ||
     integrity.duplicateStructurePaths > 0 ||
@@ -1292,6 +1548,112 @@ export function aggregateStageWarnings(stages) {
   };
 }
 
+export function createStructureDiagnosticsAccumulator() {
+  const warningCandidates = [];
+  const failureCandidates = [];
+  let warningCount = 0;
+  let warningMessagesTruncated = false;
+  let failureSamplesTruncated = false;
+
+  function retainCandidate(candidates, candidate) {
+    candidates.push(candidate);
+    candidates.sort(
+      (left, right) =>
+        left.inputIndex - right.inputIndex ||
+        left.sampleIndex - right.sampleIndex,
+    );
+    if (candidates.length > WARNING_SAMPLE_LIMIT) {
+      candidates.pop();
+      return true;
+    }
+    return false;
+  }
+
+  function retainFailure(inputIndex, batchIndex, message, sampleIndex = 0) {
+    const safeMessage = boundUtf8(
+      `[batch ${batchIndex}] ${message}`,
+      STRUCTURE_DIAGNOSTIC_SAMPLE_MAX_BYTES,
+    );
+    const omitted = retainCandidate(failureCandidates, {
+      inputIndex,
+      sampleIndex,
+      batchIndex,
+      message: safeMessage.text,
+    });
+    failureSamplesTruncated ||=
+      safeMessage.truncated || omitted;
+  }
+
+  return {
+    record(inputIndex, batchIndex, stage) {
+      const stageMessages = stage.warningMessages ?? [];
+      const stageWarningCount = stage.warningCount ?? 0;
+      warningCount += stageWarningCount;
+      for (let sampleIndex = 0; sampleIndex < stageMessages.length; sampleIndex += 1) {
+        const safeMessage = boundUtf8(
+          `[batch ${batchIndex}] ${stageMessages[sampleIndex]}`,
+          STRUCTURE_DIAGNOSTIC_SAMPLE_MAX_BYTES,
+        );
+        const omitted = retainCandidate(warningCandidates, {
+          inputIndex,
+          sampleIndex,
+          message: safeMessage.text,
+        });
+        warningMessagesTruncated ||=
+          safeMessage.truncated || omitted;
+      }
+      warningMessagesTruncated ||=
+        stage.warningMessagesTruncated ||
+        stageWarningCount > stageMessages.length;
+
+      if (stage.status === 'failed') {
+        const message = stage.stderr?.trim()
+          ? stage.stderr.trim()
+          : `Structure worker failed with exit code ${stage.exitCode ?? 'unknown'}`;
+        retainFailure(inputIndex, batchIndex, message);
+      }
+
+      return {
+        name: stage.name,
+        status: stage.status,
+        exitCode: stage.exitCode,
+        durationMs: stage.durationMs,
+        peakRssBytes: stage.peakRssBytes,
+        userCpuTimeMicros: stage.userCpuTimeMicros,
+        systemCpuTimeMicros: stage.systemCpuTimeMicros,
+        warningCount: stageWarningCount,
+        warningMessagesTruncated:
+          stage.warningMessagesTruncated ||
+          stageWarningCount > stageMessages.length,
+        stdoutTruncated: stage.stdoutTruncated,
+        stderrTruncated: stage.stderrTruncated,
+      };
+    },
+    recordAnalysisOutcome(inputIndex, batchIndex, summary) {
+      if (summary.structureFailed > 0 || summary.callGraphFailed > 0) {
+        retainFailure(
+          inputIndex,
+          batchIndex,
+          `Analysis outcomes: ${summary.structureFailed} structure failure(s), ${summary.callGraphFailed} call-graph failure(s)`,
+          1,
+        );
+      }
+    },
+    summary() {
+      return {
+        warningCount,
+        warningMessages: warningCandidates.map((candidate) => candidate.message),
+        warningMessagesTruncated,
+        failureSamples: failureCandidates.map(({ batchIndex, message }) => ({
+          batchIndex,
+          message,
+        })),
+        failureSamplesTruncated,
+      };
+    },
+  };
+}
+
 export function warningSummary(stageResults) {
   return stageResults
     .filter((stage) => stage.warningCount > 0)
@@ -1316,6 +1678,7 @@ export async function runBenchmark(options, hooks = {}) {
     [artifactRoot, '<artifacts>'],
   ];
   const onProgress = hooks.onProgress ?? (() => {});
+  const runStage = hooks.runStage ?? runNodeStage;
   const toolGit = gitMetadata(REPO_ROOT);
   const subjectGit = gitMetadata(options.repoRoot);
   const stageResults = [];
@@ -1323,6 +1686,7 @@ export async function runBenchmark(options, hooks = {}) {
   const report = {
     schemaUrl: REPORT_SCHEMA_URL,
     schemaVersion: REPORT_SCHEMA_VERSION,
+    pairId: randomUUID(),
     status: 'failed',
     mode: 'deterministic',
     run: {
@@ -1356,6 +1720,7 @@ export async function runBenchmark(options, hooks = {}) {
       costUsd: null,
     },
     warnings: [],
+    secondaryErrors: [],
     error: null,
   };
 
@@ -1363,7 +1728,7 @@ export async function runBenchmark(options, hooks = {}) {
   try {
     const scanPath = join(artifactRoot, 'scan-result.json');
     onProgress('scan');
-    const scanStage = await runNodeStage(
+    const scanStage = await runStage(
       'scan',
       SCAN_SCRIPT,
       [options.repoRoot, scanPath, '--exclude-analysis-data'],
@@ -1374,8 +1739,20 @@ export async function runBenchmark(options, hooks = {}) {
       scanStage,
       fileSizeOrZero(scanPath),
     );
+    let scan = null;
+    if (scanStage.status === 'ok') {
+      try {
+        scan = readJson(scanPath);
+        validateScanArtifact(scan);
+      } catch (error) {
+        markArtifactFailure(scanStage, 'scan', error, redactionRoots);
+        report.stages.scan = summarizeStage(
+          scanStage,
+          fileSizeOrZero(scanPath),
+        );
+      }
+    }
     if (scanStage.status === 'failed') throw new BenchmarkStageError(scanStage);
-    const scan = readJson(scanPath);
     report.scale = subjectScale(options.repoRoot, scan);
     report.stages.scan = summarizeStage(scanStage, fileSizeOrZero(scanPath), {
       files: scan.totalFiles,
@@ -1391,7 +1768,7 @@ export async function runBenchmark(options, hooks = {}) {
       files: scan.files,
     });
     onProgress('imports');
-    const importStage = await runNodeStage(
+    const importStage = await runStage(
       'imports',
       IMPORT_SCRIPT,
       [importInputPath, importOutputPath],
@@ -1402,8 +1779,20 @@ export async function runBenchmark(options, hooks = {}) {
       importStage,
       fileSizeOrZero(importOutputPath),
     );
+    let imports = null;
+    if (importStage.status === 'ok') {
+      try {
+        imports = readJson(importOutputPath);
+        validateImportArtifact(imports);
+      } catch (error) {
+        markArtifactFailure(importStage, 'imports', error, redactionRoots);
+        report.stages.imports = summarizeStage(
+          importStage,
+          fileSizeOrZero(importOutputPath),
+        );
+      }
+    }
     if (importStage.status === 'failed') throw new BenchmarkStageError(importStage);
-    const imports = readJson(importOutputPath);
     report.stages.imports = summarizeStage(
       importStage,
       fileSizeOrZero(importOutputPath),
@@ -1419,7 +1808,7 @@ export async function runBenchmark(options, hooks = {}) {
     const enrichedScan = { ...scan, importMap: imports.importMap };
     writeJson(enrichedScanPath, enrichedScan);
     onProgress('batching');
-    const batchStage = await runNodeStage(
+    const batchStage = await runStage(
       'batching',
       BATCH_SCRIPT,
       [
@@ -1434,8 +1823,20 @@ export async function runBenchmark(options, hooks = {}) {
       batchStage,
       fileSizeOrZero(batchesPath),
     );
+    let batches = null;
+    if (batchStage.status === 'ok') {
+      try {
+        batches = readJson(batchesPath);
+        validateBatchArtifact(batches);
+      } catch (error) {
+        markArtifactFailure(batchStage, 'batching', error, redactionRoots);
+        report.stages.batching = summarizeStage(
+          batchStage,
+          fileSizeOrZero(batchesPath),
+        );
+      }
+    }
     if (batchStage.status === 'failed') throw new BenchmarkStageError(batchStage);
-    const batches = readJson(batchesPath);
     const batchSizes = batches.batches.map((batch) => batch.files.length);
     const estimatedAgentInputBytes = batches.batches.reduce(
       (sum, batch) =>
@@ -1463,10 +1864,11 @@ export async function runBenchmark(options, hooks = {}) {
     onProgress('structure');
     const structureStart = performance.now();
     let completedBatches = 0;
+    const structureDiagnostics = createStructureDiagnosticsAccumulator();
     const structureRuns = await mapWithConcurrency(
       batches.batches,
       options.concurrency,
-      async (batch) => {
+      async (batch, inputIndex) => {
         const inputPath = join(artifactRoot, `structure-input-${batch.batchIndex}.json`);
         const outputPath = join(artifactRoot, `structure-output-${batch.batchIndex}.json`);
         writeJson(inputPath, {
@@ -1474,7 +1876,7 @@ export async function runBenchmark(options, hooks = {}) {
           batchFiles: batch.files,
           batchImportData: batch.batchImportData,
         });
-        const stage = await runNodeStage(
+        const stage = await runStage(
           `structure:${batch.batchIndex}`,
           STRUCTURE_SCRIPT,
           [inputPath, outputPath],
@@ -1487,6 +1889,11 @@ export async function runBenchmark(options, hooks = {}) {
           try {
             const output = readJson(outputPath);
             summary = summarizeStructureOutput(batch, output);
+            structureDiagnostics.recordAnalysisOutcome(
+              inputIndex,
+              batch.batchIndex,
+              summary,
+            );
           } catch (error) {
             stage.status = 'failed';
             stage.stderr = redactPaths(
@@ -1495,8 +1902,13 @@ export async function runBenchmark(options, hooks = {}) {
             );
           }
         }
-        return {
+        const compactStage = structureDiagnostics.record(
+          inputIndex,
+          batch.batchIndex,
           stage,
+        );
+        return {
+          stage: compactStage,
           summary,
           outputBytes: fileSizeOrZero(outputPath),
         };
@@ -1508,13 +1920,17 @@ export async function runBenchmark(options, hooks = {}) {
       .map((run) => run.summary);
     const structureAggregate = aggregateStructureSummaries(structureSummaries);
     const failedBatches = structureRuns.filter(
-      (run) => run.stage.status === 'failed',
+      (run) => run.stage.status === 'failed' || run.summary?.complete === false,
     ).length;
     const structureDurationMs =
       Math.round((performance.now() - structureStart) * 100) / 100;
-    const structureWarnings = aggregateStageWarnings(
-      structureRuns.map((run) => run.stage),
-    );
+    const structureDiagnosticsSummary = structureDiagnostics.summary();
+    const structureWarnings = {
+      warningCount: structureDiagnosticsSummary.warningCount,
+      warningMessages: structureDiagnosticsSummary.warningMessages,
+      warningMessagesTruncated:
+        structureDiagnosticsSummary.warningMessagesTruncated,
+    };
     const structureResources = aggregateStructureResources(
       structureRuns.map((run) => run.stage),
     );
@@ -1535,11 +1951,19 @@ export async function runBenchmark(options, hooks = {}) {
       userCpuTimeMicros: structureResources.userCpuTimeMicros,
       systemCpuTimeMicros: structureResources.systemCpuTimeMicros,
       ...structureWarnings,
+      failureSamples: structureDiagnosticsSummary.failureSamples,
+      failureSamplesTruncated:
+        structureDiagnosticsSummary.failureSamplesTruncated,
       outputBytes: structureRuns.reduce((sum, run) => sum + run.outputBytes, 0),
       batchesSucceeded: structureRuns.length - failedBatches,
       batchesFailed: failedBatches,
       filesAnalyzed: structureAggregate.filesAnalyzed,
       filesSkipped: structureAggregate.filesSkipped,
+      structureSucceeded: structureAggregate.structureSucceeded,
+      structureFailed: structureAggregate.structureFailed,
+      callGraphSucceeded: structureAggregate.callGraphSucceeded,
+      callGraphFailed: structureAggregate.callGraphFailed,
+      callGraphSkipped: structureAggregate.callGraphSkipped,
       entities: structureAggregate.entities,
       batchDurationMs: distribution(
         structureRuns.map((run) => run.stage.durationMs),
@@ -1596,7 +2020,20 @@ export async function runBenchmark(options, hooks = {}) {
   }
 
   if (!options.keepArtifacts) {
-    cleanupBenchmarkArtifacts(artifactRoot);
+    try {
+      const cleanupArtifacts =
+        hooks.cleanupArtifacts ?? cleanupBenchmarkArtifacts;
+      cleanupArtifacts(artifactRoot);
+    } catch {
+      const cleanupMessage = 'Unable to remove temporary benchmark artifacts';
+      report.secondaryErrors.push({
+        stage: 'cleanup',
+        message: cleanupMessage,
+      });
+      report.error ??= cleanupMessage;
+      report.status = 'failed';
+      exitCode = 1;
+    }
   }
 
   try {
@@ -1606,9 +2043,10 @@ export async function runBenchmark(options, hooks = {}) {
       jsonContents: `${JSON.stringify(report, null, 2)}\n`,
       markdownContents: renderMarkdownReport(report),
     });
-  } catch {
+  } catch (error) {
     throw new BenchmarkReportWriteError(
       options.keepArtifacts ? artifactRoot : null,
+      error instanceof BenchmarkReportWriteError ? error.recovery : {},
     );
   }
 

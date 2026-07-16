@@ -13,7 +13,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import Ajv2020 from 'ajv/dist/2020.js';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -254,33 +254,25 @@ throw new Error(\`helper failed below \${subject}/failed.txt\`);
     expect(retained).not.toContain(artifacts);
   });
 
-  it('parses a final metrics marker without a newline', async () => {
+  it('keeps unterminated helper stderr separate from worker metrics', async () => {
     const root = mkdtempSync(join(tmpdir(), 'ua benchmark eof-metrics-'));
     cleanup.push(root);
     const helperPath = join(root, 'eof-metrics-helper.mjs');
-    const metrics = {
-      peakRssBytes: 123456,
-      userCpuTimeMicros: 234,
-      systemCpuTimeMicros: 345,
-    };
     writeFileSync(
       helperPath,
       `
 import { writeSync } from 'node:fs';
-writeSync(2, ${JSON.stringify(
-        `${benchmark.STAGE_METRICS_PREFIX}${JSON.stringify(metrics)}`,
-      )});
-process.exit(0);
+writeSync(2, 'ordinary final stderr');
 `,
     );
 
     const stage = await benchmark.runNodeStage('eof-metrics', helperPath, []);
 
     expect(stage.status).toBe('ok');
-    expect(stage.peakRssBytes).toBe(metrics.peakRssBytes);
-    expect(stage.userCpuTimeMicros).toBe(metrics.userCpuTimeMicros);
-    expect(stage.systemCpuTimeMicros).toBe(metrics.systemCpuTimeMicros);
-    expect(stage.stderr).toBe('');
+    expect(stage.peakRssBytes).toBeGreaterThan(0);
+    expect(stage.userCpuTimeMicros).toBeGreaterThanOrEqual(0);
+    expect(stage.systemCpuTimeMicros).toBeGreaterThanOrEqual(0);
+    expect(stage.stderr).toBe('ordinary final stderr');
     expect(stage.warningCount).toBe(0);
   });
 
@@ -295,7 +287,6 @@ process.exit(0);
       `
 import { writeSync } from 'node:fs';
 writeSync(2, \`Warning: final \${process.argv[2]}/file.ts\`);
-process.exit(0);
 `,
     );
 
@@ -314,7 +305,25 @@ process.exit(0);
     expect(stage.warningMessagesTruncated).toBe(false);
     expect(stage.stderr).toBe('Warning: final <subject>/file.ts');
     expect(stage.stderr.endsWith('\n')).toBe(false);
-    expect(stage.peakRssBytes).toBeNull();
+    expect(stage.peakRssBytes).toBeGreaterThan(0);
+  });
+
+  it('captures resource metrics before failing an imported helper process.exit', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'ua benchmark helper-exit-'));
+    cleanup.push(root);
+    const helperPath = join(root, 'exit-helper.mjs');
+    writeFileSync(
+      helperPath,
+      `process.stderr.write('helper requested exit\\n');\nprocess.exit(7);\n`,
+    );
+
+    const stage = await benchmark.runNodeStage('helper-exit', helperPath, []);
+
+    expect(stage.status).toBe('failed');
+    expect(stage.exitCode).not.toBe(0);
+    expect(stage.peakRssBytes).toBeGreaterThan(0);
+    expect(stage.userCpuTimeMicros).toBeGreaterThanOrEqual(0);
+    expect(stage.systemCpuTimeMicros).toBeGreaterThanOrEqual(0);
   });
 });
 
@@ -363,6 +372,59 @@ describe('benchmark warning aggregation', () => {
         truncated: true,
       },
     ]);
+  });
+
+  it('compacts completed structure workers into a globally bounded deterministic sample', () => {
+    expect(benchmark.createStructureDiagnosticsAccumulator).toBeTypeOf(
+      'function',
+    );
+    const diagnostics = benchmark.createStructureDiagnosticsAccumulator();
+    const compactStages = [];
+    for (let inputIndex = 999; inputIndex >= 0; inputIndex -= 1) {
+      compactStages.push(
+        diagnostics.record(inputIndex, inputIndex + 10, {
+          name: `structure:${inputIndex + 10}`,
+          status: inputIndex % 2 === 0 ? 'failed' : 'ok',
+          exitCode: inputIndex % 2 === 0 ? 1 : 0,
+          durationMs: 1,
+          peakRssBytes: 1024,
+          userCpuTimeMicros: 1,
+          systemCpuTimeMicros: 1,
+          warningCount: 1,
+          warningMessages: [`Warning: batch ${inputIndex} ${'w'.repeat(200_000)}`],
+          warningMessagesTruncated: false,
+          stdout: 'o'.repeat(200_000),
+          stderr: `failure ${inputIndex} ${'e'.repeat(200_000)}`,
+          stdoutTruncated: true,
+          stderrTruncated: true,
+        }),
+      );
+    }
+
+    expect(
+      compactStages.every(
+        (stage) =>
+          !Object.hasOwn(stage, 'stdout') &&
+          !Object.hasOwn(stage, 'stderr') &&
+          !Object.hasOwn(stage, 'warningMessages'),
+      ),
+    ).toBe(true);
+    const summary = diagnostics.summary();
+    expect(summary.warningMessages).toHaveLength(benchmark.WARNING_SAMPLE_LIMIT);
+    expect(summary.warningMessages[0]).toContain('batch 0');
+    expect(summary.failureSamples).toHaveLength(benchmark.WARNING_SAMPLE_LIMIT);
+    expect(summary.failureSamples.map((sample) => sample.batchIndex)).toEqual([
+      10,
+      12,
+      14,
+      16,
+      18,
+    ]);
+    expect(summary.warningMessagesTruncated).toBe(true);
+    expect(summary.failureSamplesTruncated).toBe(true);
+    expect(Buffer.byteLength(JSON.stringify(summary))).toBeLessThanOrEqual(
+      64 * 1024,
+    );
   });
 });
 
@@ -434,6 +496,11 @@ describe('structure output summaries', () => {
       accountedExpectedPaths: 3,
       filesAnalyzed: 2,
       filesSkipped: 1,
+      structureSucceeded: 2,
+      structureFailed: 0,
+      callGraphSucceeded: 0,
+      callGraphFailed: 0,
+      callGraphSkipped: 2,
       missingStructurePaths: 0,
       duplicateStructurePaths: 0,
       unexpectedStructurePaths: 0,
@@ -484,6 +551,33 @@ describe('structure output summaries', () => {
     });
   });
 
+  it('retains explicit parser outcomes instead of treating every returned path as success', () => {
+    const output = {
+      scriptCompleted: true,
+      filesAnalyzed: 3,
+      filesSkipped: [],
+      analysisOutcomes: {
+        structure: { succeeded: 2, failed: 1 },
+        callGraph: { succeeded: 1, failed: 1, skipped: 1 },
+      },
+      results: [
+        { path: 'src/a.ts' },
+        { path: 'src/b.ts' },
+        { path: 'src/c.ts' },
+      ],
+    };
+
+    expect(benchmark.summarizeStructureOutput(batch, output)).toMatchObject({
+      complete: false,
+      malformed: false,
+      structureSucceeded: 2,
+      structureFailed: 1,
+      callGraphSucceeded: 1,
+      callGraphFailed: 1,
+      callGraphSkipped: 1,
+    });
+  });
+
   it('aggregates file and entity counts from compact summaries', () => {
     expect(benchmark.aggregateStructureSummaries).toBeTypeOf('function');
     const first = benchmark.summarizeStructureOutput(batch, {
@@ -509,6 +603,11 @@ describe('structure output summaries', () => {
     expect(benchmark.aggregateStructureSummaries([first, second])).toEqual({
       filesAnalyzed: 3,
       filesSkipped: 1,
+      structureSucceeded: 3,
+      structureFailed: 0,
+      callGraphSucceeded: 0,
+      callGraphFailed: 0,
+      callGraphSkipped: 3,
       entities: {
         functions: 3,
         classes: 1,
@@ -558,9 +657,10 @@ describe('structure resource aggregation', () => {
     expect(benchmark.renderMarkdownReport).toBeTypeOf('function');
     const markdown = benchmark.renderMarkdownReport({
       schemaVersion: '1.0.0',
+      pairId: '11111111-1111-4111-8111-111111111111',
       status: 'ok',
-      subject: { label: 'fixture', commit: null },
-      tool: { commit: null, packageVersion: '0.0.0' },
+      subject: { label: 'fixture', commit: null, dirty: true },
+      tool: { commit: null, dirty: true, packageVersion: '0.0.0' },
       run: { startedAt: '2026-01-01T00:00:00.000Z', durationMs: 12 },
       configuration: { concurrency: 2 },
       llm: { invoked: false },
@@ -594,6 +694,12 @@ describe('structure resource aggregation', () => {
       '| Stage | Status | Duration | Peak / max worker RSS (bytes) | User CPU (micros) | System CPU (micros) | Output (bytes) |',
     );
     expect(markdown).toContain('| structure | ok | 12 ms | 250 | 50 | 10 | 99 |');
+    expect(markdown).toContain(
+      '| Pair ID | 11111111-1111-4111-8111-111111111111 |',
+    );
+    expect(markdown).toContain('| Tool dirty | true |');
+    expect(markdown).toContain('| Subject dirty | true |');
+    expect(markdown).toMatch(/warning.*dirty/i);
   });
 });
 
@@ -662,11 +768,42 @@ describe('benchmark integrity aggregation', () => {
     );
 
     expect(integrity).toMatchObject({
-      structureCoverage: 0.6667,
+      structureCoverage: 1,
       missingStructurePaths: 1,
       duplicateStructurePaths: 1,
       unexpectedStructurePaths: 1,
       failedBatches: 1,
+    });
+    expect(benchmark.hasFailedIntegrity(integrity)).toBe(true);
+  });
+
+  it('fails integrity when explicit structure or call-graph outcomes fail', () => {
+    const summary = benchmark.summarizeStructureOutput(batch, {
+      scriptCompleted: true,
+      filesAnalyzed: 3,
+      filesSkipped: [],
+      analysisOutcomes: {
+        structure: { succeeded: 2, failed: 1 },
+        callGraph: { succeeded: 1, failed: 1, skipped: 1 },
+      },
+      results: [
+        { path: 'src/a.ts' },
+        { path: 'src/b.ts' },
+        { path: 'src/c.ts' },
+      ],
+    });
+    const integrity = benchmark.buildBenchmarkIntegrity(
+      scan,
+      {},
+      batches,
+      [summary],
+      0,
+    );
+
+    expect(integrity).toMatchObject({
+      structureCoverage: 0.6667,
+      structureFailures: 1,
+      callGraphFailures: 1,
     });
     expect(benchmark.hasFailedIntegrity(integrity)).toBe(true);
   });
@@ -950,18 +1087,37 @@ describe('large repository benchmark CLI', () => {
     cleanup.push(root);
 
     const options = parseArgs(
-      [subject, '--concurrency', '3', '--label', 'polyglot-mini'],
+      [
+        subject,
+        '--output',
+        join(root, 'report.json'),
+        '--concurrency',
+        '3',
+        '--label',
+        'polyglot-mini',
+      ],
       root,
     );
     expect(options.repoRoot).toBe(subject);
     expect(options.concurrency).toBe(3);
     expect(options.label).toBe('polyglot-mini');
-    expect(options.markdownPath).toBe(
-      join(root, 'benchmark-results', 'large-repo-report.md'),
-    );
+    expect(options.markdownPath).toBe(join(root, 'report.md'));
     expect(() => parseArgs([subject, '--concurrency', '0'], root)).toThrow(
       CliUsageError,
     );
+  });
+
+  it('requires a non-empty explicit output path and reports usage exit 2', () => {
+    const { root, subject } = makeSubject();
+    cleanup.push(root);
+
+    expect(() => parseArgs([subject], root)).toThrow(/--output/);
+    expect(() => parseArgs([subject, '--output='], root)).toThrow(/--output/);
+    const result = runCli([subject]);
+    expect(result.status).toBe(2);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain('--output <path>');
+    expect(result.stderr).toMatch(/required/i);
   });
 
   it.each(['2.5', '3junk', '1e1', ''])(
@@ -1089,9 +1245,9 @@ describe('large repository benchmark CLI', () => {
       warningMessagesTruncated: false,
     });
     expect(result.report.stages.scan.durationMs).toBeGreaterThanOrEqual(0);
-    expect(result.report.stages.scan).toHaveProperty('peakRssBytes');
-    expect(result.report.stages.scan).toHaveProperty('userCpuTimeMicros');
-    expect(result.report.stages.scan).toHaveProperty('systemCpuTimeMicros');
+    expect(result.report.stages.scan.peakRssBytes).toBeGreaterThan(0);
+    expect(result.report.stages.scan.userCpuTimeMicros).toBeGreaterThanOrEqual(0);
+    expect(result.report.stages.scan.systemCpuTimeMicros).toBeGreaterThanOrEqual(0);
     expect(existsSync(outputPath)).toBe(true);
     expect(existsSync(markdownPath)).toBe(true);
     const serialized = readFileSync(outputPath, 'utf-8');
@@ -1101,6 +1257,183 @@ describe('large repository benchmark CLI', () => {
     expect(persisted.error).not.toContain(benchmark.REPO_ROOT);
     expect(readFileSync(markdownPath, 'utf-8')).not.toContain(subject);
   });
+
+  it.each([
+    ['scan', 'missing'],
+    ['imports', 'malformed'],
+    ['batching', 'wrong-shape'],
+  ])(
+    'marks an exit-zero %s stage failed for a %s artifact and emits schema-valid partial telemetry',
+    async (targetStage, corruption) => {
+      const { root, subject } = makeSubject();
+      cleanup.push(root);
+      const outputPath = join(root, 'reports', `${targetStage}.json`);
+      const markdownPath = join(root, 'reports', `${targetStage}.md`);
+
+      const result = await benchmark.runBenchmark(
+        {
+          repoRoot: subject,
+          outputPath,
+          markdownPath,
+          label: `corrupt-${targetStage}`,
+          concurrency: 1,
+          keepArtifacts: false,
+        },
+        {
+          async runStage(name, scriptPath, args, redactionRoots) {
+            const stage = await benchmark.runNodeStage(
+              name,
+              scriptPath,
+              args,
+              redactionRoots,
+            );
+            if (name === targetStage && stage.status === 'ok') {
+              const artifactPath =
+                name === 'batching'
+                  ? args.find((arg) => arg.startsWith('--output=')).slice(
+                      '--output='.length,
+                    )
+                  : args[1];
+              if (corruption === 'missing') {
+                rmSync(artifactPath, { force: true });
+              } else if (corruption === 'malformed') {
+                writeFileSync(artifactPath, '{ definitely not JSON', 'utf-8');
+              } else {
+                writeFileSync(artifactPath, '{}\n', 'utf-8');
+              }
+            }
+            return stage;
+          },
+        },
+      );
+
+      expect(result.exitCode).toBe(1);
+      expect(result.report.status).toBe('failed');
+      expect(result.report.stages[targetStage].status).toBe('failed');
+      expect(result.report.error).toBeTruthy();
+      expectValidReport(result.report);
+      expectValidReport(JSON.parse(readFileSync(outputPath, 'utf-8')));
+      expect(existsSync(markdownPath)).toBe(true);
+    },
+    70_000,
+  );
+
+  it.each([
+    [
+      'string file.sizeLines',
+      (scan, subject) => {
+        scan.files[0].sizeLines = subject;
+      },
+    ],
+    [
+      'negative file.sizeLines',
+      (scan) => {
+        scan.files[0].sizeLines = -1;
+      },
+    ],
+    [
+      'string filteredByIgnore',
+      (scan, subject) => {
+        scan.filteredByIgnore = subject;
+      },
+    ],
+    [
+      'negative filteredByIgnore',
+      (scan) => {
+        scan.filteredByIgnore = -1;
+      },
+    ],
+    [
+      'non-record stats',
+      (scan) => {
+        scan.stats = null;
+      },
+    ],
+    [
+      'non-record stats.byCategory',
+      (scan) => {
+        scan.stats.byCategory = [];
+      },
+    ],
+    [
+      'non-count stats.byCategory value',
+      (scan, subject) => {
+        scan.stats.byCategory = { code: subject };
+      },
+    ],
+    [
+      'non-record stats.byLanguage',
+      (scan) => {
+        scan.stats.byLanguage = [];
+      },
+    ],
+    [
+      'negative stats.byLanguage value',
+      (scan) => {
+        scan.stats.byLanguage = { TypeScript: -1 };
+      },
+    ],
+    [
+      'stats.filesScanned inconsistent with totalFiles',
+      (scan) => {
+        scan.stats.filesScanned = scan.totalFiles + 1;
+      },
+    ],
+  ])(
+    'rejects an exit-zero scan artifact with %s before copying nested values into the report',
+    async (_description, corruptScan) => {
+      const { root, subject } = makeSubject();
+      cleanup.push(root);
+      const outputPath = join(root, 'reports', 'nested-scan.json');
+      const markdownPath = join(root, 'reports', 'nested-scan.md');
+      const stagesStarted = [];
+
+      const result = await benchmark.runBenchmark(
+        {
+          repoRoot: subject,
+          outputPath,
+          markdownPath,
+          label: 'nested-corrupt-scan',
+          concurrency: 1,
+          keepArtifacts: false,
+        },
+        {
+          async runStage(name, scriptPath, args, redactionRoots) {
+            stagesStarted.push(name);
+            if (name !== 'scan') {
+              throw new Error('nested scan corruption reached a later stage');
+            }
+            const stage = await benchmark.runNodeStage(
+              name,
+              scriptPath,
+              args,
+              redactionRoots,
+            );
+            expect(stage.status).toBe('ok');
+            const artifactPath = args[1];
+            const scan = JSON.parse(readFileSync(artifactPath, 'utf-8'));
+            corruptScan(scan, subject);
+            writeFileSync(artifactPath, `${JSON.stringify(scan, null, 2)}\n`, 'utf-8');
+            return stage;
+          },
+        },
+      );
+
+      expect(stagesStarted).toEqual(['scan']);
+      expect(result.exitCode).toBe(1);
+      expect(result.report.status).toBe('failed');
+      expect(result.report.scale).toBeNull();
+      expect(result.report.stages.scan.status).toBe('failed');
+      expect(result.report.stages.scan).not.toHaveProperty('files');
+      expectValidReport(result.report);
+      const serialized = readFileSync(outputPath, 'utf-8');
+      const persisted = JSON.parse(serialized);
+      expectValidReport(persisted);
+      expect(serialized).not.toContain(subject);
+      expect(readFileSync(markdownPath, 'utf-8')).not.toContain(subject);
+    },
+    70_000,
+  );
 
   it('wraps cleanup operation failures without exposing artifact paths', () => {
     const artifactRoot = join(tmpdir(), 'ua-large-bench-private-cleanup');
@@ -1126,6 +1459,91 @@ describe('large repository benchmark CLI', () => {
     expect(cleanupError.message).not.toContain(artifactRoot);
     expect(cleanupError.message).not.toContain('EPERM');
   });
+
+  it('preserves a primary stage failure, records cleanup as secondary, and still delivers both reports', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'ua stage cleanup failure-'));
+    cleanup.push(root);
+    const subject = join(root, 'not-a-directory.txt');
+    const outputPath = join(root, 'reports', 'failed.json');
+    const markdownPath = join(root, 'reports', 'failed.md');
+    writeFileSync(subject, 'not a directory\n');
+    let artifactRoot;
+
+    const result = await benchmark.runBenchmark(
+      {
+        repoRoot: subject,
+        outputPath,
+        markdownPath,
+        label: 'stage-and-cleanup-failure',
+        concurrency: 1,
+        keepArtifacts: false,
+      },
+      {
+        cleanupArtifacts(path) {
+          artifactRoot = path;
+          throw new benchmark.BenchmarkArtifactCleanupError();
+        },
+      },
+    );
+    if (artifactRoot) cleanup.push(artifactRoot);
+
+    expect(result.exitCode).toBe(1);
+    expect(result.report.status).toBe('failed');
+    expect(result.report.error).not.toBe(
+      'Unable to remove temporary benchmark artifacts',
+    );
+    expect(result.report.secondaryErrors).toEqual([
+      {
+        stage: 'cleanup',
+        message: 'Unable to remove temporary benchmark artifacts',
+      },
+    ]);
+    expect(result.artifactRoot).toBeNull();
+    expectValidReport(result.report);
+    expect(JSON.parse(readFileSync(outputPath, 'utf-8')).error).toBe(
+      result.report.error,
+    );
+    const markdown = readFileSync(markdownPath, 'utf-8');
+    expect(markdown).toContain(result.report.error.split(/\r?\n/, 1)[0]);
+    expect(markdown).toContain('Unable to remove temporary benchmark artifacts');
+    expect(JSON.stringify(result.report)).not.toContain(artifactRoot);
+  });
+
+  it('turns an otherwise successful run into exit 1 when artifact cleanup fails', async () => {
+    const { root, subject } = makeSubject();
+    cleanup.push(root);
+    const outputPath = join(root, 'reports', 'cleanup-failed.json');
+    const markdownPath = join(root, 'reports', 'cleanup-failed.md');
+    let artifactRoot;
+
+    const result = await benchmark.runBenchmark(
+      {
+        repoRoot: subject,
+        outputPath,
+        markdownPath,
+        label: 'cleanup-failure',
+        concurrency: 1,
+        keepArtifacts: false,
+      },
+      {
+        cleanupArtifacts(path) {
+          artifactRoot = path;
+          throw new benchmark.BenchmarkArtifactCleanupError();
+        },
+      },
+    );
+    if (artifactRoot) cleanup.push(artifactRoot);
+
+    expect(result.exitCode).toBe(1);
+    expect(result.report.status).toBe('failed');
+    expect(result.report.error).toBe(
+      'Unable to remove temporary benchmark artifacts',
+    );
+    expect(result.report.secondaryErrors).toHaveLength(1);
+    expectValidReport(result.report);
+    expect(existsSync(outputPath)).toBe(true);
+    expect(existsSync(markdownPath)).toBe(true);
+  }, 70_000);
 
   it('rolls back both reports when the second report commit fails', () => {
     const root = mkdtempSync(join(tmpdir(), 'ua report transaction-'));
@@ -1177,6 +1595,146 @@ describe('large repository benchmark CLI', () => {
     expect(readFileSync(markdownPath, 'utf-8')).toBe('old markdown\n');
     expect(readFileSync(sentinelPath, 'utf-8')).toBe('unrelated\n');
     expect(readdirSync(reportsDirectory).sort()).toEqual(entriesBefore);
+  });
+
+  it('excludes a concurrent writer while the shared pair lock is held', () => {
+    const root = mkdtempSync(join(tmpdir(), 'ua report pair lock-'));
+    cleanup.push(root);
+    const outputPath = join(root, 'result.json');
+    const markdownPath = join(root, 'result.md');
+    expect(benchmark.reportPairLockPath).toBeTypeOf('function');
+    const lockPath = benchmark.reportPairLockPath(outputPath, markdownPath);
+    writeFileSync(lockPath, 'held by another writer\n', { flag: 'wx' });
+    let deliveryError;
+
+    try {
+      benchmark.deliverBenchmarkReports({
+        outputPath,
+        markdownPath,
+        jsonContents: 'new json\n',
+        markdownContents: 'new markdown\n',
+      });
+    } catch (error) {
+      deliveryError = error;
+    }
+
+    expect(deliveryError).toBeInstanceOf(benchmark.BenchmarkReportWriteError);
+    expect(deliveryError.recovery).toMatchObject({
+      lockAcquisitionFailed: true,
+    });
+    expect(existsSync(outputPath)).toBe(false);
+    expect(existsSync(markdownPath)).toBe(false);
+    expect(JSON.stringify(deliveryError.recovery)).not.toContain(root);
+  });
+
+  it.runIf(process.platform === 'win32')(
+    'uses one pair lock for Windows path-case aliases',
+    () => {
+      const root = mkdtempSync(join(tmpdir(), 'ua report case lock-'));
+      cleanup.push(root);
+      const outputPath = join(root, 'result.json');
+      const markdownPath = join(root, 'result.md');
+      const caseAliasRoot = root.toUpperCase();
+
+      expect(
+        basename(
+          benchmark.reportPairLockPath(
+            join(caseAliasRoot, 'RESULT.JSON'),
+            join(caseAliasRoot, 'RESULT.MD'),
+          ),
+        ),
+      ).toBe(
+        basename(benchmark.reportPairLockPath(outputPath, markdownPath)),
+      );
+    },
+  );
+
+  it('surfaces a rollback restore failure as bounded path-free recovery metadata', () => {
+    const root = mkdtempSync(join(tmpdir(), 'ua report rollback recovery-'));
+    cleanup.push(root);
+    const outputPath = join(root, 'result.json');
+    const markdownPath = join(root, 'result.md');
+    writeFileSync(outputPath, 'old json\n');
+    writeFileSync(markdownPath, 'old markdown\n');
+    let deliveryError;
+
+    try {
+      benchmark.deliverBenchmarkReports(
+        {
+          outputPath,
+          markdownPath,
+          jsonContents: 'new json\n',
+          markdownContents: 'new markdown\n',
+        },
+        {
+          renameSync(source, destination) {
+            if (destination === markdownPath && source.endsWith('.tmp')) {
+              throw new Error('injected second install failure');
+            }
+            if (destination === markdownPath && source.endsWith('.backup')) {
+              throw new Error('injected restore failure');
+            }
+            renameSync(source, destination);
+          },
+        },
+      );
+    } catch (error) {
+      deliveryError = error;
+    }
+
+    expect(deliveryError).toBeInstanceOf(benchmark.BenchmarkReportWriteError);
+    expect(deliveryError.recovery).toMatchObject({
+      restoreFailures: 1,
+    });
+    expect(JSON.stringify(deliveryError.recovery)).not.toContain(root);
+    expect(JSON.stringify(deliveryError.recovery)).not.toContain('injected');
+  });
+
+  it('surfaces a rollback target-removal failure as path-free recovery metadata', () => {
+    const root = mkdtempSync(join(tmpdir(), 'ua report rollback removal-'));
+    cleanup.push(root);
+    const outputPath = join(root, 'result.json');
+    const markdownPath = join(root, 'result.md');
+    writeFileSync(outputPath, 'old json\n');
+    writeFileSync(markdownPath, 'old markdown\n');
+    let removalFailed = false;
+    let deliveryError;
+
+    try {
+      benchmark.deliverBenchmarkReports(
+        {
+          outputPath,
+          markdownPath,
+          jsonContents: 'new json\n',
+          markdownContents: 'new markdown\n',
+        },
+        {
+          renameSync(source, destination) {
+            if (destination === markdownPath && source.endsWith('.tmp')) {
+              throw new Error('injected second install failure');
+            }
+            renameSync(source, destination);
+          },
+          rmSync(path, options) {
+            if (path === markdownPath && !removalFailed) {
+              removalFailed = true;
+              throw new Error('injected rollback removal failure');
+            }
+            rmSync(path, options);
+          },
+        },
+      );
+    } catch (error) {
+      deliveryError = error;
+    }
+
+    expect(removalFailed).toBe(true);
+    expect(deliveryError).toBeInstanceOf(benchmark.BenchmarkReportWriteError);
+    expect(deliveryError.recovery).toMatchObject({
+      rollbackRemoveFailures: 1,
+    });
+    expect(JSON.stringify(deliveryError.recovery)).not.toContain(root);
+    expect(JSON.stringify(deliveryError.recovery)).not.toContain('injected');
   });
 
   it('removes an owned partial temp when a staging write fails', () => {
@@ -1365,6 +1923,9 @@ describe('large repository benchmark CLI', () => {
     expectValidReport(report);
     expect(report.schemaUrl).toBe(schema.$id);
     expect(report.schemaVersion).toBe('1.0.0');
+    expect(report.pairId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
     expect(report.status).toBe('ok');
     expect(report.mode).toBe('deterministic');
     expect(report.subject).toEqual({
@@ -1389,6 +1950,7 @@ describe('large repository benchmark CLI', () => {
     expect(report.determinism.outputDigest).toMatch(/^[a-f0-9]{64}$/);
     expect(JSON.stringify(report)).not.toContain(subject);
     expect(markdown).toContain('# Large Repository Benchmark Report');
+    expect(markdown).toContain(`| Pair ID | ${report.pairId} |`);
     expect(markdown).toContain('| Files | 3 |');
     expect(markdown).toContain('| LLM invoked | No |');
     expect(markdown).toContain('Peak / max worker RSS (bytes)');
@@ -1414,6 +1976,44 @@ describe('large repository benchmark CLI', () => {
     expect(secondReport.stages.batching.batchSizes).toEqual(
       report.stages.batching.batchSizes,
     );
+  }, 70_000);
+
+  it('keeps full Unicode benchmark digests stable across locale environments', () => {
+    const { root, subject } = makeSubject();
+    cleanup.push(root);
+    const firstReportPath = join(root, 'locale-c.json');
+    const secondReportPath = join(root, 'locale-sv.json');
+    for (const name of ['Z', 'a', 'ä']) {
+      writeFileSync(join(subject, 'src', `${name}.ts`), `export const ${
+        name === 'ä' ? 'accented' : name
+      } = 1;\n`);
+    }
+    writeFileSync(
+      join(subject, 'src', 'index.ts'),
+      [
+        'import "./ä";',
+        'import "./Z";',
+        'import "./a";',
+        'export const answer = 42;',
+        '',
+      ].join('\n'),
+    );
+
+    const runWithLocale = (locale, reportPath) =>
+      runCli([subject, '--output', reportPath, '--concurrency', '2'], {
+        env: { ...process.env, LANG: locale, LC_ALL: locale },
+      });
+    const firstResult = runWithLocale('C', firstReportPath);
+    const secondResult = runWithLocale('sv_SE.UTF-8', secondReportPath);
+
+    expect(firstResult.status, firstResult.stderr).toBe(0);
+    expect(secondResult.status, secondResult.stderr).toBe(0);
+    const firstReport = JSON.parse(readFileSync(firstReportPath, 'utf-8'));
+    const secondReport = JSON.parse(readFileSync(secondReportPath, 'utf-8'));
+    expectValidReport(firstReport);
+    expectValidReport(secondReport);
+    expect(secondReport.determinism).toEqual(firstReport.determinism);
+    expect(secondReport.stages.imports.edges).toBe(3);
   }, 70_000);
 
   it('handles an empty repository as a valid deterministic run', () => {

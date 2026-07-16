@@ -7,6 +7,7 @@
   "required": [
     "schemaUrl",
     "schemaVersion",
+    "pairId",
     "status",
     "mode",
     "run",
@@ -20,6 +21,7 @@
     "determinism",
     "llm",
     "warnings",
+    "secondaryErrors",
     "error"
   ],
   "properties": {
@@ -27,6 +29,10 @@
       "const": "https://raw.githubusercontent.com/Egonex-AI/Understand-Anything/main/docs/benchmarks/large-repo-report-1.0.0.schema.json"
     },
     "schemaVersion": { "const": "1.0.0" },
+    "pairId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
     "status": { "enum": ["ok", "degraded", "failed"] },
     "mode": { "const": "deterministic" },
     "run": { "$ref": "#/$defs/run" },
@@ -57,6 +63,11 @@
     "warnings": {
       "type": "array",
       "items": { "$ref": "#/$defs/warning" }
+    },
+    "secondaryErrors": {
+      "type": "array",
+      "maxItems": 5,
+      "items": { "$ref": "#/$defs/secondaryError" }
     },
     "error": { "type": ["string", "null"] }
   },
@@ -93,6 +104,7 @@
           },
           "integrity": { "$ref": "#/$defs/successIntegrity" },
           "determinism": { "$ref": "#/$defs/determinism" },
+          "secondaryErrors": { "type": "array", "maxItems": 0 },
           "error": { "type": "null" }
         }
       }
@@ -127,6 +139,34 @@
             }
           }
         }
+      }
+    },
+    {
+      "if": {
+        "properties": { "status": { "const": "degraded" } },
+        "required": ["status"]
+      },
+      "then": {
+        "anyOf": [
+          {
+            "properties": {
+              "warnings": { "type": "array", "minItems": 1 }
+            },
+            "required": ["warnings"]
+          },
+          {
+            "properties": {
+              "integrity": {
+                "type": "object",
+                "properties": {
+                  "filesSkipped": { "type": "integer", "minimum": 1 }
+                },
+                "required": ["filesSkipped"]
+              }
+            },
+            "required": ["integrity"]
+          }
+        ]
       }
     },
     {
@@ -438,7 +478,9 @@
         "warningCount",
         "warningMessages",
         "warningMessagesTruncated",
-        "outputBytes"
+        "outputBytes",
+        "failureSamples",
+        "failureSamplesTruncated"
       ],
       "properties": {
         "status": { "$ref": "#/$defs/status" },
@@ -449,11 +491,22 @@
         "warningCount": { "$ref": "#/$defs/count" },
         "warningMessages": { "$ref": "#/$defs/warningMessages" },
         "warningMessagesTruncated": { "type": "boolean" },
+        "failureSamples": {
+          "type": "array",
+          "maxItems": 5,
+          "items": { "$ref": "#/$defs/failureSample" }
+        },
+        "failureSamplesTruncated": { "type": "boolean" },
         "outputBytes": { "$ref": "#/$defs/count" },
         "batchesSucceeded": { "$ref": "#/$defs/count" },
         "batchesFailed": { "$ref": "#/$defs/count" },
         "filesAnalyzed": { "$ref": "#/$defs/count" },
         "filesSkipped": { "$ref": "#/$defs/count" },
+        "structureSucceeded": { "$ref": "#/$defs/count" },
+        "structureFailed": { "$ref": "#/$defs/count" },
+        "callGraphSucceeded": { "$ref": "#/$defs/count" },
+        "callGraphFailed": { "$ref": "#/$defs/count" },
+        "callGraphSkipped": { "$ref": "#/$defs/count" },
         "entities": { "$ref": "#/$defs/entities" },
         "batchDurationMs": { "$ref": "#/$defs/distribution" }
       },
@@ -469,6 +522,11 @@
               "batchesFailed",
               "filesAnalyzed",
               "filesSkipped",
+              "structureSucceeded",
+              "structureFailed",
+              "callGraphSucceeded",
+              "callGraphFailed",
+              "callGraphSkipped",
               "entities",
               "batchDurationMs"
             ]
@@ -496,6 +554,8 @@
         "unexpectedBatchFiles",
         "missingImportTargets",
         "structureCoverage",
+        "structureFailures",
+        "callGraphFailures",
         "filesSkipped",
         "failedBatches",
         "missingStructurePaths",
@@ -510,6 +570,8 @@
         "unexpectedBatchFiles": { "$ref": "#/$defs/count" },
         "missingImportTargets": { "$ref": "#/$defs/count" },
         "structureCoverage": { "type": "number", "minimum": 0, "maximum": 1 },
+        "structureFailures": { "$ref": "#/$defs/count" },
+        "callGraphFailures": { "$ref": "#/$defs/count" },
         "filesSkipped": { "$ref": "#/$defs/count" },
         "failedBatches": { "$ref": "#/$defs/count" },
         "missingStructurePaths": { "$ref": "#/$defs/count" },
@@ -527,6 +589,8 @@
         "unexpectedBatchFiles": { "const": 0 },
         "missingImportTargets": { "const": 0 },
         "structureCoverage": { "const": 1 },
+        "structureFailures": { "const": 0 },
+        "callGraphFailures": { "const": 0 },
         "failedBatches": { "const": 0 },
         "missingStructurePaths": { "const": 0 },
         "duplicateStructurePaths": { "const": 0 },
@@ -561,7 +625,7 @@
       "required": ["stage", "count", "messages", "truncated"],
       "properties": {
         "stage": { "enum": ["scan", "imports", "batching", "structure"] },
-        "count": { "$ref": "#/$defs/count" },
+        "count": { "type": "integer", "minimum": 1 },
         "messages": { "$ref": "#/$defs/warningMessages" },
         "truncated": { "type": "boolean" }
       }
@@ -570,6 +634,24 @@
       "type": "array",
       "maxItems": 5,
       "items": { "type": "string" }
+    },
+    "failureSample": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["batchIndex", "message"],
+      "properties": {
+        "batchIndex": { "$ref": "#/$defs/count" },
+        "message": { "type": "string", "minLength": 1, "maxLength": 4096 }
+      }
+    },
+    "secondaryError": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stage", "message"],
+      "properties": {
+        "stage": { "const": "cleanup" },
+        "message": { "const": "Unable to remove temporary benchmark artifacts" }
+      }
     }
   }
 }

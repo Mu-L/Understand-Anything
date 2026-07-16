@@ -48,6 +48,15 @@ The benchmark tests compile that schema and validate normal, empty, degraded,
 and partial failed reports against it. The runner does not perform runtime
 schema validation.
 
+The JSON and Markdown files share a generated `pairId`. Writers for the same
+pair are serialized with an exclusive lock, and a caught synchronous delivery
+failure attempts to restore both previous files. This is not a crash-atomic
+filesystem transaction: process termination, power loss, or a machine crash
+between renames can still leave a missing or mismatched pair. Consumers should
+compare the `pairId` in both files and reject a mismatch. Recovery failures are
+reported only as bounded counters; report errors do not expose filesystem
+paths.
+
 The default concurrency is 5. Override it with `--concurrency 1` through
 `--concurrency 32`. Use the same concurrency when comparing runs.
 
@@ -63,6 +72,12 @@ Published warning summaries are bounded. Each entry records the stage, the
 total warning `count`, up to five sanitized `messages`, and a `truncated` flag
 that reports omitted or shortened detail.
 
+Structure diagnostics are bounded across the whole run, rather than once per
+batch. The report retains deterministic samples and aggregate success, failure,
+and skip counts, but discards raw per-worker stdout and stderr after those
+summaries are formed. Structural coverage counts successful structure analyses;
+failed analyses remain failures instead of being reported as skipped work.
+
 `--keep-artifacts` preserves intermediate files and prints their location.
 Those private files contain absolute paths and detailed structural data; do not
 publish them without reviewing and sanitizing them.
@@ -75,7 +90,8 @@ For results that another contributor can reproduce:
    repository. The report captures both commits when the directories are Git
    worktrees.
 2. Use clean worktrees where possible. The report records `dirty: true` when
-   tracked or untracked changes are present.
+   tracked or untracked changes are present, and the Markdown report displays a
+   visible warning when either the tool or subject worktree is dirty.
 3. Keep the operating system, Node.js version, machine, concurrency, and
    `.understandignore` rules constant between compared runs.
 4. Run at least three times and retain every report. Treat the first run as a
@@ -138,7 +154,7 @@ explicit.
 | Exit code | Meaning | Report behavior |
 | ---: | --- | --- |
 | `0` | Completed with status `ok` or `degraded` | JSON and Markdown are written |
-| `1` | A deterministic stage or integrity check failed | Partial reports are written when the output location is writable |
+| `1` | A deterministic stage, integrity check, or temporary-artifact cleanup failed | Partial reports are written when the output location is writable; cleanup failures appear in `secondaryErrors` without replacing the primary stage error |
 | `2` | Invalid CLI usage | No report is written |
 
 `degraded` means the deterministic pipeline completed but reported warnings or
